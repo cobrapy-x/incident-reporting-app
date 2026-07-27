@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Local database & app data (never commit real data)
+*.db
+incident.db
+app_data/
+
+# Secrets — private keys must NEVER be committed
+*.key
+.env
+secrets/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Flet build output
+build/

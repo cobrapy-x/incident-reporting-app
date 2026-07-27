@@ -1,0 +1,16 @@
+# Render Blueprint — deploys the encrypted backend as a free Docker web service.
+# On render.com: New +  ->  Blueprint  ->  connect this repo. Render reads this file.
+#
+# Prototype note: the free plan has NO persistent disk and SLEEPS when idle, so
+# the SQLite database here lives in /tmp and is TEMPORARY — it resets on redeploy.
+# Great for testing; move to a persistent host (Oracle Always Free, or a paid
+# Render disk) before real use.
+services:
+  - type: web
+    name: incident-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: DB_PATH
+        value: /tmp/incident.db
