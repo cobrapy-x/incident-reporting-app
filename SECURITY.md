@@ -1,74 +1,104 @@
 # Security & Encryption Design
 
-How the app keeps group chat, media, and incident reports private — and, just
+How the app keeps group chat, media and incident reports private — and, just
 as important, what it does **not** protect against.
 
 ## One-sentence version
 
-Everything is encrypted **on the phone** before it is sent, with a key the
-server never sees, so the server (and anyone who steals its database) only ever
-holds unreadable ciphertext.
+Everything is encrypted **on the phone** before it is sent, with keys Firebase
+never sees, so Firebase (and anyone who breaks into it) only ever holds
+unreadable ciphertext — and Firestore security rules additionally stop anyone
+outside a group, including other organisations' employers, from even fetching it.
 
-## Building blocks (libsodium via PyNaCl, plus Argon2 for passwords)
+## Two walls
+
+1. **Crypto (the main wall).** Content is encrypted with a per-group key that
+   only members hold. Even with full database access you get ciphertext.
+2. **Firestore security rules (`firestore.rules`).** Only members can read a
+   group's items; only admins of *that group's* organisation can change its
+   membership; each person can read only their own sealed key; the user
+   directory can't be browsed. This stops cross-organisation snooping on
+   metadata and ciphertext too.
+
+## Building blocks (libsodium via PyNaCl)
 
 | Purpose | What we use | Why |
 |---|---|---|
-| User identity | X25519 key pair | Private key stays on device |
+| User identity | X25519 key pair | Private key never leaves the device unencrypted |
 | Sharing the group key | Sealed box (`crypto_box_seal`) | Only one member's private key can open it |
 | Chat, media, incidents | XSalsa20-Poly1305 (`SecretBox`) | Secret **and** tamper-proof |
-| Passwords | Argon2id (`argon2-cffi`) | Winner of the Password Hashing Competition |
-| Login sessions | Random 256-bit bearer tokens | Checked per request |
+| Password stretching | Argon2id (64 MiB, interactive) | Slows password guessing |
+| Auth secret / backup key | BLAKE2b with separate personalisation | Two unrelated secrets from one password |
+| Accounts & sessions | Firebase Auth (ID tokens, ~1 h, auto-refreshed) | Managed, free |
+
+## Passwords and the key backup
+
+Your password is never sent anywhere. On the phone it goes through Argon2id
+(salted by your email) and is split into:
+
+- an **auth secret** — this is what Firebase Auth receives as "the password";
+- a **backup key** — encrypts your private key. The encrypted backup lives in
+  your own `users/{uid}` document (only you can read it).
+
+So you can sign in on a new phone and get your history back, while Firebase
+(which only sees the auth secret) can't compute the backup key.
 
 ## How a message travels
 
-1. Each user registers: keys are generated on the device; only the **public**
-   key and an **Argon2 hash** of the password are uploaded.
-2. A group has one random 256-bit **group key**, created on a member's device.
-3. That group key is **sealed** to each member's public key and stored as an
-   opaque blob. The server cannot open it.
-4. To send, the phone encrypts the chat text / photo / whole incident report
-   with the group key and uploads only `nonce + ciphertext`.
-5. To read, a member downloads their sealed group key, opens it with their
-   private key, then decrypts locally.
-
-## How this maps to "the best available"
-
-The state of the art for group end-to-end encryption is the **Signal Protocol**
-and **MLS (RFC 9420)**. This project deliberately does **not** re-implement
-those from scratch — hand-rolling ratchets is how real apps get breached.
-Instead it uses the **same primitives and the same "seal the group key to each
-member" pattern**, via a library used in production by many apps.
+1. Sign-up: keys are made on the device. Uploaded: public key, encrypted
+   private-key backup, profile (name, email, phone, role), and hashed
+   email/phone directory entries so employers can find you.
+2. An employer creates a group: their phone makes a random 256-bit group key and
+   **seals** it to each member's public key (`groups/{id}/keys/{uid}_{version}`).
+3. To send, the phone encrypts text / photo / the whole incident with the group
+   key and uploads `nonce + ciphertext` (photos split into ~700 KB chunks).
+4. To read, a member opens their sealed copy of the key and decrypts locally.
+5. When someone is **removed**, the rules *require* a new key version; the
+   employer's phone seals a fresh key to everyone who remains. The removed
+   person can't read anything sent afterwards (and the rules block them anyway).
+   New members get the current key, so they can read history since the last removal.
 
 ## Threat model — what IS protected
 
-- **A stolen server / database:** only ciphertext, sealed keys, public keys, and
-  Argon2 password hashes. Content stays unreadable. (`demo.py` proves the
-  plaintext is nowhere in the database file.)
-- **A curious or malicious server operator:** cannot read content.
-- **A network eavesdropper:** sees only ciphertext (run behind HTTPS too).
+- **Firebase / Google, or a database leak:** only ciphertext, sealed keys, public
+  keys, encrypted key backups. Content stays unreadable.
+- **A rival employer (another organisation):** can't read, list, join, post to,
+  or create groups in your org — rules refuse it, and they hold no keys.
+- **Employees:** can't add/remove people or post as someone else.
 - **Tampering:** any modified message fails to decrypt.
-- **An outsider not in the group:** has no group key and is refused by the API.
+- **A network eavesdropper:** HTTPS + ciphertext.
 
 ## Threat model — what is NOT (yet) protected — be aware
 
-- **A compromised phone.** If someone unlocks a member's device they can read
-  that member's data. Encryption cannot fix a stolen, unlocked phone.
-- **Full forward secrecy / post-compromise security.** Signal/MLS rotate keys on
-  *every message* (the "double ratchet"). Here the group key rotates only when
-  **membership changes** (`rotate_group_key`). A reasonable middle ground, not
-  the maximum. Moving to a ratchet/MLS library is the upgrade path.
-- **Metadata.** The server learns who is in a group and when messages are sent,
-  though not their contents.
-- **Key verification.** For highest assurance, members should verify each
-  other's public-key fingerprints out-of-band (a future "safety number" screen).
-- **Private-key backup.** The private key lives on one device. If a user loses
-  the phone they lose access to old messages. Add an encrypted key-backup flow
-  before real-world use.
+- **The employer of your own group can read it.** They created it and hold the
+  key (that's how they add people). Groups are for work conversations.
+- **A compromised or unlocked phone.** Whoever holds it can read what that
+  person can read.
+- **Weak passwords.** Someone with database access could try to guess your
+  password offline against your key backup. Argon2id slows this down; a long
+  password stops it.
+- **Forgotten password = lost history.** Firebase's "reset password" email
+  doesn't help — the backup is locked with your real password.
+- **Metadata.** Firebase sees who is in which group, when items are sent, and
+  plaintext **names** of people, organisations and groups. Phone numbers and
+  emails are stored in your private profile; the directory stores only SHA-256
+  hashes of them (phone-number hashes can be brute-forced, so treat phone numbers
+  as visible to Firebase).
+- **Phone numbers aren't verified** (SMS needs the paid Blaze plan). A number is
+  first-come-first-served. Employers see the person's name and safety number
+  before adding them — check it.
+- **Key substitution.** A malicious server could swap a public key. Compare
+  **safety numbers** (Members tab / "My safety number") in person for high
+  assurance.
+- **Forward secrecy.** Keys rotate on removal, not per message. Signal/MLS-style
+  ratchets are the upgrade path.
 
 ## Rules for contributors
 
-- **Never** send a private key, group key, or plaintext password to the server.
-- **Never** commit a real database or any `.key`/`.env` file (see `.gitignore`).
-- Always run behind **HTTPS** in production.
-- Keep encryption in `e2e.py` and network calls in `client_api.py`; keep the
-  server "dumb" (storage + auth only).
+- **Never** send a private key, group key, real password or plaintext to Firebase.
+- **Never** ship `firebase-admin` or a service-account key in the app — it
+  bypasses the rules.
+- Change `firestore.rules` and `fake_firebase.py` together, then run
+  `bash run_emulator_demo.sh` (real rules) and `python demo.py`.
+- Deploy rules after every change: `firebase deploy --only firestore:rules`.
+- Keep crypto in `e2e.py`, Firebase calls in `firebase_rest.py`/`client_api.py`.

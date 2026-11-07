@@ -1,0 +1,188 @@
+rules_version = '2';
+
+// ===========================================================================
+// Incident Reporting App — Firestore security rules
+// ---------------------------------------------------------------------------
+// These rules ARE the backend. There is no server: the phone app talks to
+// Firestore directly, and these rules decide who may read/write what.
+//
+// What they enforce
+//   * Orgs:    only an EMPLOYER account can create an org; only that org's
+//              admins can see it.
+//   * Groups:  only admins of the group's org can create groups, add or
+//              remove members. Only MEMBERS can read a group or its items.
+//              An employer of org A can never read, join or modify a group of
+//              org B (they are not in B's admins and not in B's members).
+//   * Keys:    each member can read only their OWN sealed copy of the group key.
+//   * Items:   chat + incidents are ciphertext. Only members can read/write;
+//              sender can't be spoofed; removing a member forces a key rotation.
+//
+// Even if these rules were wrong, content stays end-to-end encrypted: the
+// rules are the second wall, the crypto is the first.
+//
+// Keep `fake_firebase.py` (offline test double) in sync with this file.
+// ===========================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------------------------------------------------
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function onlyChanged(keys) {
+      return incoming().diff(existing()).affectedKeys().hasOnly(keys);
+    }
+    function userDoc(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function orgDoc(orgId) { return get(/databases/$(database)/documents/orgs/$(orgId)).data; }
+    function groupDoc(gid) { return get(/databases/$(database)/documents/groups/$(gid)).data; }
+    function groupAfter(gid) { return getAfter(/databases/$(database)/documents/groups/$(gid)).data; }
+    function isOrgAdmin(orgId) { return signedIn() && me() in orgDoc(orgId).admins; }
+    function isMember(gid) { return signedIn() && me() in groupDoc(gid).members; }
+    function validName(n) { return n is string && n.size() > 0 && n.size() <= 100; }
+    function noDuplicates(list) { return list.toSet().size() == list.size(); }
+
+    // Lookup ids are 'email_' / 'phone_' + sha256 hex of the normalised value,
+    // so the directory can be queried by exact match but not browsed.
+    function myEmailLookupId() {
+      return 'email_' + hashing.sha256(request.auth.token.email.lower()).toHexString().lower();
+    }
+
+    // ---------- private profile (only you can see it) -----------------------
+    match /users/{uid} {
+      allow get: if signedIn() && me() == uid;
+      allow list: if false;
+      allow create: if signedIn() && me() == uid
+        && incoming().keys().hasOnly(['displayName', 'email', 'phone', 'role', 'keyBackup', 'createdAt'])
+        && incoming().role in ['employee', 'employer']
+        && incoming().email == request.auth.token.email
+        && validName(incoming().displayName)
+        && incoming().createdAt == request.time;
+      // role and email are fixed forever; keyBackup changes on password change
+      allow update: if signedIn() && me() == uid
+        && onlyChanged(['displayName', 'phone', 'keyBackup'])
+        && validName(incoming().displayName);
+      allow delete: if false;
+    }
+
+    // ---------- public identity: name + PUBLIC key -------------------------
+    match /publicKeys/{uid} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && me() == uid
+        && incoming().keys().hasOnly(['publicKey', 'displayName'])
+        && incoming().publicKey is string && incoming().publicKey.size() == 44
+        && validName(incoming().displayName);
+      allow update: if signedIn() && me() == uid
+        && onlyChanged(['publicKey', 'displayName'])
+        && incoming().publicKey is string && incoming().publicKey.size() == 44
+        && validName(incoming().displayName);
+      allow delete: if false;
+    }
+
+    // ---------- directory: hashed email / phone -> uid ---------------------
+    match /lookup/{id} {
+      allow get: if signedIn();          // exact-match only
+      allow list: if false;              // nobody can browse the directory
+      allow create: if signedIn()
+        && incoming().keys().hasOnly(['uid'])
+        && incoming().uid == me()
+        && (id == myEmailLookupId() || id.matches('phone_[0-9a-f]{64}'));
+      allow update: if false;
+      allow delete: if signedIn() && existing().uid == me();
+    }
+
+    // ---------- organisations ----------------------------------------------
+    match /orgs/{orgId} {
+      allow get, list: if signedIn() && me() in existing().admins;
+      allow create: if signedIn()
+        && userDoc(me()).role == 'employer'
+        && incoming().keys().hasOnly(['name', 'ownerUid', 'admins', 'createdAt'])
+        && incoming().ownerUid == me()
+        && incoming().admins == [me()]
+        && validName(incoming().name)
+        && incoming().createdAt == request.time;
+      allow update: if signedIn() && existing().ownerUid == me()
+        && onlyChanged(['name', 'admins'])
+        && me() in incoming().admins
+        && validName(incoming().name);
+      allow delete: if false;
+    }
+
+    // ---------- groups -----------------------------------------------------
+    match /groups/{gid} {
+      allow get, list: if signedIn() && me() in existing().members;
+
+      allow create: if isOrgAdmin(incoming().orgId)
+        && incoming().keys().hasOnly(['orgId', 'orgName', 'name', 'createdBy', 'members', 'keyVersion', 'createdAt'])
+        && incoming().createdBy == me()
+        && me() in incoming().members
+        && incoming().members.size() <= 50
+        && noDuplicates(incoming().members)
+        && incoming().keyVersion == 1
+        && validName(incoming().name)
+        && incoming().orgName == orgDoc(incoming().orgId).name
+        && incoming().createdAt == request.time;
+
+      // Only an admin of THIS group's org (who is also a member, so holds the
+      // key) may add/remove people. Removing anyone requires a new key version.
+      allow update: if isOrgAdmin(existing().orgId)
+        && me() in existing().members
+        && onlyChanged(['members', 'keyVersion', 'name'])
+        && me() in incoming().members
+        && incoming().members.size() <= 50
+        && noDuplicates(incoming().members)
+        && validName(incoming().name)
+        && (incoming().keyVersion == existing().keyVersion
+            || incoming().keyVersion == existing().keyVersion + 1)
+        && (existing().members.toSet().difference(incoming().members.toSet()).size() == 0
+            || incoming().keyVersion == existing().keyVersion + 1);
+      allow delete: if false;
+
+      // ---- sealed group keys: one doc per (member, key version) ----------
+      match /keys/{keyId} {
+        allow get, list: if signedIn()
+          && (existing().uid == me() || existing().wrappedBy == me());
+        allow create: if signedIn()
+          && isOrgAdmin(groupAfter(gid).orgId)
+          && me() in groupAfter(gid).members
+          && incoming().keys().hasOnly(['uid', 'version', 'wrapped', 'wrappedBy'])
+          && incoming().uid in groupAfter(gid).members
+          && incoming().version == groupAfter(gid).keyVersion
+          && keyId == incoming().uid + '_' + string(incoming().version)
+          && incoming().wrappedBy == me()
+          && incoming().wrapped is string && incoming().wrapped.size() < 200;
+        allow update, delete: if false;
+      }
+
+      // ---- chat messages + incident reports (ciphertext only) -------------
+      match /items/{itemId} {
+        allow get, list: if isMember(gid);
+        allow create: if isMember(gid)
+          && incoming().keys().hasOnly(['kind', 'sender', 'keyVersion', 'nonce', 'body', 'chunks',
+                                        'media', 'rev', 'createdAt', 'updatedAt'])
+          && incoming().kind in ['chat', 'incident']
+          && incoming().sender == me()
+          && incoming().keyVersion == groupDoc(gid).keyVersion
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        // incidents can be edited by any member (updates, status, photos)
+        allow update: if isMember(gid)
+          && existing().kind == 'incident'
+          && onlyChanged(['keyVersion', 'nonce', 'body', 'chunks', 'media', 'rev', 'updatedAt', 'editedBy'])
+          && incoming().keyVersion == groupDoc(gid).keyVersion
+          && incoming().editedBy == me()
+          && incoming().updatedAt == request.time;
+        allow delete: if false;
+
+        // large ciphertext (photos) is split across chunk docs (1 MiB doc limit)
+        match /chunks/{chunkId} {
+          allow get, list: if isMember(gid);
+          allow create, delete: if isMember(gid);
+          allow update: if false;
+        }
+      }
+    }
+  }
+}

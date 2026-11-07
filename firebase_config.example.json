@@ -1,0 +1,5 @@
+{
+  "apiKey": "PASTE-WEB-API-KEY-HERE",
+  "projectId": "your-firebase-project-id",
+  "emulatorHost": null
+}
