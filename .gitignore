@@ -22,3 +22,10 @@ secrets/
 
 # Flet build output
 build/
+
+# Firebase
+firebase_config.json
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
