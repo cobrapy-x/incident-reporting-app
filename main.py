@@ -1,7 +1,7 @@
 """
-Incident Reporting App  —  Firebase + end-to-end encrypted
-==========================================================
-Cross-platform (Android / iOS / desktop) app built with Flet.
+Facilis Relatio  —  incident reporting, Firebase + end-to-end encrypted
+=======================================================================
+Cross-platform (Android / iOS / desktop) app built with Flet 1.x.
 
 Screens:
   1. Sign in / create account  (name, email, phone, password, employee|employer)
@@ -14,9 +14,10 @@ they are sent. Firebase only ever stores ciphertext. The heavy lifting lives
 in client_api.py (Firebase + crypto) and e2e.py (encryption); this file is
 just the screens.
 
-Run it:
+Run it on your computer:
     pip install -r requirements.txt
     flet run main.py
+Build the phone apps: see BUILD_MOBILE.md
 """
 
 import io
@@ -64,8 +65,8 @@ def shrink_image(data: bytes, max_side=1600, quality=80) -> bytes:
     Uses Pillow if it's installed; otherwise sends the original bytes.
     """
     try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(data))
+        from PIL import Image, ImageOps
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))   # keep phone photos upright
         img.thumbnail((max_side, max_side))
         out = io.BytesIO()
         img.convert("RGB").save(out, "JPEG", quality=quality, optimize=True)
@@ -147,97 +148,125 @@ def make_pdf(incident, group_name, photo_paths=None):
 # ---------------------------------------------------------------------------
 # THE APP
 # ---------------------------------------------------------------------------
+APP_NAME = "Facilis Relatio"
+BRAND_BLUE = "#0D47A1"
+BRAND_AMBER = "#FFB300"
+
+
 def main(page: ft.Page):
-    page.title = "Incident Reporting"
-    page.scroll = ft.ScrollMode.AUTO
-    page.padding = 16
+    page.title = APP_NAME
+    page.padding = 0
+    page.theme = ft.Theme(color_scheme_seed=BRAND_BLUE)
+    page.dark_theme = ft.Theme(color_scheme_seed=BRAND_BLUE)
 
     settings = load_settings()
     app = {"client": None, "group_id": None, "group_name": None,
            "is_admin": False, "screen": 0}
+    is_mobile = page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS)
 
-    try:
-        config = FirebaseConfig.load()
-    except Exception as ex:
-        page.add(ft.Text("Firebase isn't configured yet", size=20, weight=ft.FontWeight.BOLD),
-                 ft.Text(str(ex)))
-        page.update()
-        return
+    # one file picker for the whole app (it's a page "service")
+    picker = ft.FilePicker()
 
-    def new_screen():
-        """Clear the page; bumping the counter stops any old poller."""
+    # ---------------------------------------------------------------- helpers
+    def show(*controls, scroll=True):
+        """Replace the screen. Content sits inside the phone's safe area
+        (clear of the notch / status bar / home indicator)."""
         app["screen"] += 1
         page.controls.clear()
-        # drop old file pickers (keep any open snackbar/dialog)
-        page.overlay[:] = [o for o in page.overlay if not isinstance(o, ft.FilePicker)]
+        page.add(ft.SafeArea(expand=True, minimum_padding=ft.Padding.all(16), content=ft.Column(
+            list(controls), expand=True, spacing=10,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,     # full-width fields
+            scroll=ft.ScrollMode.AUTO if scroll else None)))
+        page.update()
         return app["screen"]
 
     def toast(msg):
-        page.open(ft.SnackBar(ft.Text(msg)))
+        page.show_dialog(ft.SnackBar(content=ft.Text(msg)))
 
     def show_error(e):
         toast(f"Error: {friendly(e)}")
 
+    def close_dialog(e=None):
+        page.pop_dialog()
+
     def busy(button, text="Working…"):
         """Disable a button while slow work (key derivation, network) runs."""
-        old = button.text
-        button.disabled, button.text = True, text
+        old = button.content
+        button.disabled, button.content = True, text
         page.update()
 
         def done():
-            button.disabled, button.text = False, old
+            button.disabled, button.content = False, old
             page.update()
         return done
 
-    def save_media(name, data):
-        """Write a decrypted image to a 'downloads' folder and report where."""
+    async def deliver_file(name, data, mime):
+        """Phones: open the share sheet (save to Files, WhatsApp, email…).
+        Desktop: save into the app's downloads folder."""
+        if is_mobile:
+            await ft.Share().share_files([ft.ShareFile(data=data, name=name, mime_type=mime)])
+            return
         folder = os.path.join(DATA_DIR, "downloads")
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, name or "image")
+        path = os.path.join(folder, name or "file")
         with open(path, "wb") as f:
             f.write(data)
         toast(f"Saved to {path}")
-        return path
 
     def image_view(media, width=220, on_remove=None):
-        """Show a decrypted image inline, with Save and optional Remove."""
-        b64 = base64.b64encode(media["bytes"]).decode()
-        row = [
-            ft.Icon(ft.icons.PHOTO, size=13),
-            ft.Text(media["name"] or "image", size=11),
-            ft.TextButton("Save", icon=ft.icons.DOWNLOAD,
-                          on_click=lambda e, m=media: save_media(m["name"], m["bytes"])),
-        ]
+        """Show a decrypted image inline, with Save/Share and optional Remove."""
+        async def save(e, m=media):
+            await deliver_file(m["name"] or "image.jpg", m["bytes"], "image/jpeg")
+        row = [ft.Icon(ft.Icons.PHOTO, size=13),
+               ft.Text(media["name"] or "image", size=11, expand=True),
+               ft.TextButton("Share" if is_mobile else "Save",
+                             icon=ft.Icons.SHARE if is_mobile else ft.Icons.DOWNLOAD,
+                             on_click=save)]
         if on_remove is not None:
-            row.append(ft.TextButton("Remove", icon=ft.icons.DELETE, on_click=on_remove))
+            row.append(ft.TextButton("Remove", icon=ft.Icons.DELETE, on_click=on_remove))
         return ft.Column(spacing=4, controls=[
-            ft.Image(src_base64=b64, width=width, fit=ft.ImageFit.CONTAIN,
+            ft.Image(src=media["bytes"], width=width, fit=ft.BoxFit.CONTAIN,
                      border_radius=6,
                      error_content=ft.Text("Can't preview this image", size=11)),
             ft.Row(row),
         ])
 
-    def read_photo(path):
-        with open(path, "rb") as f:
-            raw = f.read()
-        small = shrink_image(raw)
-        name = os.path.basename(path)
-        if small is not raw:
-            name = os.path.splitext(name)[0] + ".jpg"
-        return name, small
+    async def pick_photos(multiple=False):
+        """Pick photo(s) → [(name, jpeg_bytes)], shrunk before encryption."""
+        files = await picker.pick_files(file_type=ft.FilePickerFileType.IMAGE,
+                                        allow_multiple=multiple, with_data=True)
+        out = []
+        for f in files or []:
+            data = f.bytes
+            if data is None and f.path:
+                with open(f.path, "rb") as fh:
+                    data = fh.read()
+            if data is None:
+                continue
+            small = shrink_image(data)
+            name = f.name or "photo.jpg"
+            if small is not data:
+                name = os.path.splitext(name)[0] + ".jpg"
+            out.append((name, small))
+        return out
+
+    def logo(size=96):
+        return ft.Image(src="icon.png", width=size, height=size, border_radius=size // 5,
+                        error_content=ft.Icon(ft.Icons.ENGINEERING, size=size // 2))
 
     # =====================================================================
     # SCREEN 1 — Sign in / create account
     # =====================================================================
-    def show_auth():
-        new_screen()
+    def show_auth(tab=None):
         app["client"] = None
+        if tab is None:
+            tab = 0 if settings.get("email") else 1
 
         # ---- sign in
         li_email = ft.TextField(label="Email", value=settings.get("email", ""),
-                                keyboard_type=ft.KeyboardType.EMAIL)
+                                keyboard_type=ft.KeyboardType.EMAIL, autocorrect=False)
         li_pw = ft.TextField(label="Password", password=True, can_reveal_password=True)
-        li_btn = ft.ElevatedButton("Sign in", icon=ft.icons.LOGIN)
+        li_btn = ft.FilledButton("Sign in", icon=ft.Icons.LOGIN)
 
         def do_login(e):
             done = busy(li_btn, "Signing in…")
@@ -252,11 +281,13 @@ def main(page: ft.Page):
                 done()
                 show_error(ex)
         li_btn.on_click = do_login
+        li_pw.on_submit = do_login
 
         # ---- create account
-        su_name = ft.TextField(label="Full name")
-        su_email = ft.TextField(label="Email", keyboard_type=ft.KeyboardType.EMAIL)
-        su_phone = ft.TextField(label="Phone (with country code, e.g. +91 98765 43210)",
+        su_name = ft.TextField(label="Full name", capitalization=ft.TextCapitalization.WORDS)
+        su_email = ft.TextField(label="Email", keyboard_type=ft.KeyboardType.EMAIL,
+                                autocorrect=False)
+        su_phone = ft.TextField(label="Phone (with country code)", hint_text="+91 98765 43210",
                                 keyboard_type=ft.KeyboardType.PHONE)
         su_pw = ft.TextField(label="Password (min 8 characters)", password=True,
                              can_reveal_password=True)
@@ -265,7 +296,7 @@ def main(page: ft.Page):
             ft.Radio(value="employee", label="Employee — I'll be added to my team's groups"),
             ft.Radio(value="employer", label="Employer — I'll create an organisation and groups"),
         ]))
-        su_btn = ft.ElevatedButton("Create account", icon=ft.icons.PERSON_ADD)
+        su_btn = ft.FilledButton("Create account", icon=ft.Icons.PERSON_ADD)
 
         def do_register(e):
             if su_pw.value != su_pw2.value:
@@ -279,38 +310,43 @@ def main(page: ft.Page):
                 settings["email"] = c.profile["email"]
                 save_settings(settings)
                 app["client"] = c
-                toast("Account created. We sent a verification email.")
                 show_home()
+                toast("Account created. We sent a verification email.")
             except Exception as ex:
                 done()
                 show_error(ex)
         su_btn.on_click = do_register
 
-        page.add(
-            ft.Text("Incident Reporting", size=26, weight=ft.FontWeight.BOLD),
-            ft.Row([ft.Icon(ft.icons.LOCK, size=16),
-                    ft.Text("End-to-end encrypted", size=13)]),
-            ft.Tabs(selected_index=0 if settings.get("email") else 1, animation_duration=150, tabs=[
-                ft.Tab(text="Sign in", content=ft.Container(padding=10, content=ft.Column([
-                    li_email, li_pw, li_btn,
-                    ft.Text("Works on any device — your encrypted key backup is "
-                            "unlocked with your password.", size=11, italic=True),
-                ]))),
-                ft.Tab(text="Create account", content=ft.Container(padding=10, content=ft.Column([
-                    su_name, su_email, su_phone, su_pw, su_pw2,
-                    ft.Text("Account type", weight=ft.FontWeight.BOLD), su_role, su_btn,
-                    ft.Text("Your password never leaves this device. If you forget it, "
-                            "your old messages can't be recovered.", size=11, italic=True),
-                ]))),
-            ]),
+        sign_in = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=12,
+                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
+            ft.Container(height=4), li_email, li_pw, li_btn,
+            ft.Text("Works on any device — your encrypted key backup is "
+                    "unlocked with your password.", size=11, italic=True),
+        ])
+        sign_up = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=12,
+                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
+            ft.Container(height=4), su_name, su_email, su_phone, su_pw, su_pw2,
+            ft.Text("Account type", weight=ft.FontWeight.BOLD), su_role, su_btn,
+            ft.Text("Your password never leaves this device. If you forget it, "
+                    "your old messages can't be recovered.", size=11, italic=True),
+        ])
+        show(
+            ft.Row([logo(64), ft.Column(spacing=2, controls=[
+                ft.Text(APP_NAME, size=24, weight=ft.FontWeight.BOLD),
+                ft.Row([ft.Icon(ft.Icons.LOCK, size=14),
+                        ft.Text("End-to-end encrypted", size=12)]),
+            ])]),
+            ft.Tabs(length=2, selected_index=tab, expand=True, content=ft.Column(expand=True, controls=[
+                ft.TabBar(tabs=[ft.Tab(label="Sign in"), ft.Tab(label="Create account")]),
+                ft.TabBarView(expand=True, controls=[sign_in, sign_up]),
+            ])),
+            scroll=False,
         )
-        page.update()
 
     # =====================================================================
     # SCREEN 2 — Home: groups (+ org management for employers)
     # =====================================================================
     def show_home():
-        new_screen()
         c = app["client"]
 
         def change_password_dialog(e):
@@ -324,36 +360,37 @@ def main(page: ft.Page):
                     return
                 try:
                     c.change_password(old.value, new.value)
-                    page.close(dlg)
+                    close_dialog()
                     toast("Password changed.")
                 except Exception as ex:
                     show_error(ex)
-            dlg = ft.AlertDialog(title=ft.Text("Change password"),
-                                 content=ft.Column([old, new, new2], tight=True),
-                                 actions=[ft.TextButton("Cancel", on_click=lambda ev: page.close(dlg)),
-                                          ft.TextButton("Save", on_click=save)])
-            page.open(dlg)
+            page.show_dialog(ft.AlertDialog(
+                title=ft.Text("Change password"),
+                content=ft.Column([old, new, new2], tight=True),
+                actions=[ft.TextButton("Cancel", on_click=close_dialog),
+                         ft.TextButton("Save", on_click=save)]))
 
         def fingerprint_dialog(e):
-            dlg = ft.AlertDialog(
+            page.show_dialog(ft.AlertDialog(
                 title=ft.Text("Your safety number"),
                 content=ft.Text(f"{c.my_fingerprint()}\n\nCompare this in person with what "
                                 "others see next to your name in a group's Members tab. "
                                 "If it matches, nobody is intercepting your messages."),
-                actions=[ft.TextButton("OK", on_click=lambda ev: page.close(dlg))])
-            page.open(dlg)
+                actions=[ft.TextButton("OK", on_click=close_dialog)]))
 
         header = ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
-            ft.Text(f"{c.username} · {'Employer' if c.is_employer else 'Employee'}", size=13),
+            ft.Row(expand=True, controls=[logo(36), ft.Column(spacing=0, expand=True, controls=[
+                ft.Text(c.username, size=15, weight=ft.FontWeight.BOLD),
+                ft.Text("Employer" if c.is_employer else "Employee", size=12)])]),
             ft.PopupMenuButton(items=[
-                ft.PopupMenuItem(text="My safety number", icon=ft.icons.FINGERPRINT,
+                ft.PopupMenuItem("My safety number", icon=ft.Icons.FINGERPRINT,
                                  on_click=fingerprint_dialog),
-                ft.PopupMenuItem(text="Change password", icon=ft.icons.PASSWORD,
+                ft.PopupMenuItem("Change password", icon=ft.Icons.PASSWORD,
                                  on_click=change_password_dialog),
-                ft.PopupMenuItem(text="Refresh", icon=ft.icons.REFRESH,
+                ft.PopupMenuItem("Refresh", icon=ft.Icons.REFRESH,
                                  on_click=lambda e: show_home()),
-                ft.PopupMenuItem(text="Sign out", icon=ft.icons.LOGOUT,
-                                 on_click=lambda e: show_auth()),
+                ft.PopupMenuItem("Sign out", icon=ft.Icons.LOGOUT,
+                                 on_click=lambda e: show_auth(tab=0)),
             ]),
         ])
 
@@ -378,13 +415,13 @@ def main(page: ft.Page):
                 except Exception as ex:
                     show_error(ex)
 
-            grp_org = ft.Dropdown(label="Organisation",
-                                  options=[ft.dropdown.Option(o["id"], o["name"]) for o in orgs],
+            grp_org = ft.Dropdown(label="Organisation", expand=True,
+                                  options=[ft.DropdownOption(key=o["id"], text=o["name"]) for o in orgs],
                                   value=orgs[0]["id"] if orgs else None)
             grp_name = ft.TextField(label="New group name")
-            grp_members = ft.TextField(label="Add people (emails or phones, comma-separated)",
-                                       multiline=True)
-            grp_btn = ft.ElevatedButton("Create group", icon=ft.icons.GROUP_ADD)
+            grp_members = ft.TextField(label="Add people (optional)", multiline=True,
+                                       hint_text="emails or phones, separated by commas")
+            grp_btn = ft.FilledButton("Create group", icon=ft.Icons.GROUP_ADD)
 
             def add_group(e):
                 if not grp_org.value:
@@ -404,41 +441,38 @@ def main(page: ft.Page):
             grp_btn.on_click = add_group
 
             employer_panel = [
-                ft.Text("Your organisations", size=20, weight=ft.FontWeight.BOLD),
+                ft.Text("Your organisations", size=18, weight=ft.FontWeight.BOLD),
                 ft.Text(", ".join(o["name"] for o in orgs) or "None yet.", size=13),
-                ft.Row([org_name, ft.ElevatedButton("Create", icon=ft.icons.BUSINESS,
-                                                    on_click=add_org)]),
-                ft.Container(height=8),
+                ft.Row([org_name, ft.IconButton(ft.Icons.ADD_BUSINESS, tooltip="Create organisation",
+                                                on_click=add_org)]),
                 ft.Text("New group", size=16, weight=ft.FontWeight.BOLD),
-                grp_org, grp_name, grp_members, grp_btn,
-                ft.Divider(),
+                ft.Row([grp_org]), grp_name, grp_members, grp_btn,
             ]
 
         cards = []
         for g in groups:
-            cards.append(ft.Card(content=ft.Container(padding=12, content=ft.Row(
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                controls=[
+            cards.append(ft.Card(content=ft.Container(
+                padding=12, on_click=lambda e, g=g: open_group(g), content=ft.Row(controls=[
                     ft.Column(spacing=2, expand=True, controls=[
                         ft.Text(g["name"], size=16, weight=ft.FontWeight.BOLD),
-                        ft.Text(g["orgName"], size=12, color=ft.colors.SECONDARY),
-                        ft.Row([ft.Icon(ft.icons.LOCK, size=12),
+                        ft.Text(g["orgName"], size=12, color=ft.Colors.SECONDARY),
+                        ft.Row([ft.Icon(ft.Icons.LOCK, size=12),
                                 ft.Text(f"{g['members']}/50 members · encrypted"
                                         + (" · you manage this" if g["isAdmin"] else ""),
                                         size=12)]),
                     ]),
-                    ft.ElevatedButton("Open", on_click=lambda e, g=g: open_group(g)),
+                    ft.Button("Open", on_click=lambda e, g=g: open_group(g)),
                 ]))))
 
         empty = ("No groups yet. Create one above." if c.is_employer else
                  "No groups yet. Ask your employer to add you using your email or phone number.")
-        page.add(
+        show(
             header,
-            *employer_panel,
-            ft.Text("Your groups", size=22, weight=ft.FontWeight.BOLD),
+            ft.Divider(),
+            ft.Text("Your groups", size=20, weight=ft.FontWeight.BOLD),
             *(cards or [ft.Text(empty, italic=True)]),
+            *([ft.Divider()] + employer_panel if employer_panel else []),
         )
-        page.update()
 
     def open_group(g):
         app["group_id"], app["group_name"] = g["id"], g["name"]
@@ -449,39 +483,41 @@ def main(page: ft.Page):
     # SCREEN 3 — One group: Chat + Incidents + Members
     # =====================================================================
     def show_group(tab=0):
-        screen = new_screen()
         c = app["client"]
         gid, gname = app["group_id"], app["group_name"]
 
         # ---- Chat tab ----
-        chat_input = ft.TextField(label="Message", expand=True)
-        chat_photo = {"path": None}
+        chat_input = ft.TextField(hint_text="Message", expand=True, multiline=True,
+                                  min_lines=1, max_lines=4, shift_enter=True)
+        chat_photo = {"name": None, "bytes": None}
         chat_photo_label = ft.Text("", size=11, italic=True)
-
-        def on_chat_photo(e):
-            if e.files:
-                chat_photo["path"] = e.files[0].path
-                chat_photo_label.value = "photo attached"
-                page.update()
-
-        chat_picker = ft.FilePicker(on_result=on_chat_photo)
-        page.overlay.append(chat_picker)
-        chat_list = ft.Column(spacing=8)
+        chat_list = ft.ListView(expand=True, spacing=8, auto_scroll=True)
         seen = {"n": -1}
+
+        async def on_attach(e):
+            try:
+                picked = await pick_photos()
+            except Exception as ex:
+                show_error(ex)
+                return
+            if picked:
+                chat_photo["name"], chat_photo["bytes"] = picked[0]
+                chat_photo_label.value = f"📎 {picked[0][0]} attached"
+                page.update()
 
         def render_chat(msgs):
             chat_list.controls.clear()
             for m in msgs:
                 mine = m["senderUid"] == c.uid
                 rows = [ft.Text(f"{'You' if mine else m['sender']} · {m['at']}", size=11,
-                                weight=ft.FontWeight.BOLD, color=ft.colors.SECONDARY),
-                        ft.Text(m["text"], size=13, italic=m["locked"], selectable=True)]
+                                weight=ft.FontWeight.BOLD, color=ft.Colors.SECONDARY),
+                        ft.Text(m["text"], size=14, italic=m["locked"], selectable=True)]
                 if m["media"]:
                     rows.append(image_view(m["media"]))
                 chat_list.controls.append(ft.Container(
-                    bgcolor=ft.colors.PRIMARY_CONTAINER if mine else ft.colors.SURFACE_CONTAINER_HIGHEST,
-                    border_radius=8, padding=8, margin=ft.margin.only(left=40 if mine else 0,
-                                                                      right=0 if mine else 40),
+                    bgcolor=ft.Colors.PRIMARY_CONTAINER if mine else ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    border_radius=10, padding=10,
+                    margin=ft.Margin.only(left=40 if mine else 0, right=0 if mine else 40),
                     content=ft.Column(rows, spacing=2)))
             if not msgs:
                 chat_list.controls.append(ft.Text("No messages yet.", italic=True))
@@ -501,20 +537,17 @@ def main(page: ft.Page):
                 if not quiet:
                     show_error(ex)
 
-        send_btn = ft.IconButton(ft.icons.SEND)
+        send_btn = ft.IconButton(ft.Icons.SEND, tooltip="Send")
 
         def send_chat(e):
-            if not chat_input.value.strip() and not chat_photo["path"]:
+            if not chat_input.value.strip() and not chat_photo["bytes"]:
                 return
-            media_bytes = media_name = None
             try:
-                if chat_photo["path"]:
-                    media_name, media_bytes = read_photo(chat_photo["path"])
                 send_btn.disabled = True
                 page.update()
-                c.send_chat(gid, chat_input.value.strip(), media_bytes, media_name)
+                c.send_chat(gid, chat_input.value.strip(), chat_photo["bytes"], chat_photo["name"])
                 chat_input.value = ""
-                chat_photo["path"] = None
+                chat_photo["name"] = chat_photo["bytes"] = None
                 chat_photo_label.value = ""
                 refresh_chat()
             except Exception as ex:
@@ -525,16 +558,11 @@ def main(page: ft.Page):
         send_btn.on_click = send_chat
         chat_input.on_submit = send_chat
 
-        chat_tab = ft.Column([
-            ft.Row([ft.TextButton("Refresh", icon=ft.icons.REFRESH,
-                                  on_click=lambda e: refresh_chat()),
-                    ft.Text(f"auto-refreshes every {POLL_SECONDS}s", size=11, italic=True)]),
+        chat_tab = ft.Column(expand=True, controls=[
             chat_list,
-            ft.Row([chat_input,
-                    ft.IconButton(ft.icons.CAMERA_ALT, on_click=lambda e: chat_picker.pick_files(
-                        file_type=ft.FilePickerFileType.IMAGE)),
-                    send_btn]),
             chat_photo_label,
+            ft.Row([ft.IconButton(ft.Icons.ADD_A_PHOTO, tooltip="Attach photo", on_click=on_attach),
+                    chat_input, send_btn]),
         ])
 
         # ---- Incidents tab ----
@@ -545,31 +573,31 @@ def main(page: ft.Page):
             try:
                 incs = c.read_incidents(gid)
                 for inc in incs:
+                    closed = inc.get("status", "Open") != "Open"
                     incident_list.controls.append(ft.Card(content=ft.Container(
-                        padding=12, content=ft.Row(
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            controls=[
-                                ft.Column(spacing=2, expand=True, controls=[
-                                    ft.Text(inc.get("title", "-"), size=15,
-                                            weight=ft.FontWeight.BOLD),
-                                    ft.Text(f"Assigned: {inc.get('assigned_to') or '-'}"
-                                            f"  ·  Target: {inc.get('target_date') or '-'}",
-                                            size=12),
-                                    ft.Text(f"Status: {inc.get('status', 'Open')}", size=12),
-                                ]),
-                                ft.ElevatedButton("View",
-                                                  on_click=lambda e, i=inc: open_incident(i)),
-                            ]))))
+                        padding=12, on_click=lambda e, i=inc: open_incident(i),
+                        content=ft.Row(controls=[
+                            ft.Icon(ft.Icons.CHECK_CIRCLE if closed else ft.Icons.WARNING_AMBER,
+                                    color=ft.Colors.GREEN if closed else BRAND_AMBER),
+                            ft.Column(spacing=2, expand=True, controls=[
+                                ft.Text(inc.get("title", "-"), size=15, weight=ft.FontWeight.BOLD),
+                                ft.Text(f"Assigned: {inc.get('assigned_to') or '-'}"
+                                        f"  ·  Target: {inc.get('target_date') or '-'}", size=12),
+                                ft.Text(f"Status: {inc.get('status', 'Open')}", size=12),
+                            ]),
+                            ft.Button("View", on_click=lambda e, i=inc: open_incident(i)),
+                        ]))))
                 if not incs:
                     incident_list.controls.append(ft.Text("No incidents reported.", italic=True))
             except Exception as ex:
                 show_error(ex)
             page.update()
 
-        incidents_tab = ft.Column([
-            ft.Row([ft.ElevatedButton("Report incident", icon=ft.icons.ADD,
-                                      on_click=lambda e: show_new_incident()),
-                    ft.TextButton("Refresh", icon=ft.icons.REFRESH,
+        incidents_tab = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO,
+                                  horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
+            ft.Row([ft.FilledButton("Report incident", icon=ft.Icons.ADD,
+                              on_click=lambda e: show_new_incident()),
+                    ft.TextButton("Refresh", icon=ft.Icons.REFRESH,
                                   on_click=lambda e: refresh_incidents())]),
             incident_list,
         ])
@@ -582,16 +610,16 @@ def main(page: ft.Page):
             member_list.controls.clear()
             try:
                 for m in c.group_members(gid):
-                    trailing = []
+                    trailing = None
                     if app["is_admin"] and not m["isMe"]:
-                        trailing.append(ft.IconButton(
-                            ft.icons.PERSON_REMOVE, tooltip="Remove (rotates the key)",
-                            on_click=lambda e, m=m: confirm_remove(m)))
+                        trailing = ft.IconButton(
+                            ft.Icons.PERSON_REMOVE, tooltip="Remove (rotates the key)",
+                            on_click=lambda e, m=m: confirm_remove(m))
                     member_list.controls.append(ft.ListTile(
-                        leading=ft.Icon(ft.icons.PERSON),
+                        leading=ft.Icon(ft.Icons.PERSON),
                         title=ft.Text(m["displayName"] + (" (you)" if m["isMe"] else "")),
                         subtitle=ft.Text(f"Safety number: {m['fingerprint']}", size=11),
-                        trailing=trailing[0] if trailing else None))
+                        trailing=trailing))
             except Exception as ex:
                 show_error(ex)
             page.update()
@@ -606,7 +634,7 @@ def main(page: ft.Page):
                 return
 
             def really_add(ev):
-                page.close(dlg)
+                close_dialog()
                 try:
                     c.add_member_uid(gid, who["uid"])
                     add_field.value = ""
@@ -614,35 +642,33 @@ def main(page: ft.Page):
                     refresh_members()
                 except Exception as ex:
                     show_error(ex)
-            dlg = ft.AlertDialog(
+            page.show_dialog(ft.AlertDialog(
                 title=ft.Text(f"Add {who['displayName']}?"),
                 content=ft.Text(f"Found: {who['displayName']}\nSafety number: {who['fingerprint']}"
                                 "\n\nThey'll be able to read this group's messages sent "
                                 "since the last time someone was removed."),
-                actions=[ft.TextButton("Cancel", on_click=lambda ev: page.close(dlg)),
-                         ft.TextButton("Add", on_click=really_add)])
-            page.open(dlg)
+                actions=[ft.TextButton("Cancel", on_click=close_dialog),
+                         ft.TextButton("Add", on_click=really_add)]))
 
         def confirm_remove(m):
             def really_remove(ev):
-                page.close(dlg)
+                close_dialog()
                 try:
                     c.remove_member(gid, m["uid"])
                     toast(f"Removed {m['displayName']}; group key rotated.")
                     refresh_members()
                 except Exception as ex:
                     show_error(ex)
-            dlg = ft.AlertDialog(
+            page.show_dialog(ft.AlertDialog(
                 title=ft.Text(f"Remove {m['displayName']}?"),
                 content=ft.Text("A new encryption key will be made for everyone else, so they "
                                 "can't read anything sent after this."),
-                actions=[ft.TextButton("Cancel", on_click=lambda ev: page.close(dlg)),
-                         ft.TextButton("Remove", on_click=really_remove)])
-            page.open(dlg)
+                actions=[ft.TextButton("Cancel", on_click=close_dialog),
+                         ft.TextButton("Remove", on_click=really_remove)]))
 
-        members_tab = ft.Column([
-            *([ft.Row([add_field, ft.ElevatedButton("Add", icon=ft.icons.PERSON_ADD,
-                                                    on_click=find_and_add)])]
+        members_tab = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO, controls=[
+            *([ft.Row([add_field, ft.IconButton(ft.Icons.PERSON_ADD, tooltip="Add",
+                                                on_click=find_and_add)])]
               if app["is_admin"] else
               [ft.Text("Only your employer can add or remove people.", size=12, italic=True)]),
             member_list,
@@ -650,17 +676,21 @@ def main(page: ft.Page):
                     size=11, italic=True),
         ])
 
-        page.add(
-            ft.Row([ft.TextButton("← Groups", on_click=lambda e: show_home())]),
-            ft.Row([ft.Icon(ft.icons.LOCK, size=16),
-                    ft.Text(gname, size=22, weight=ft.FontWeight.BOLD)]),
-            ft.Tabs(selected_index=tab, tabs=[
-                ft.Tab(text="Chat", content=ft.Container(chat_tab, padding=10)),
-                ft.Tab(text="Incidents", content=ft.Container(incidents_tab, padding=10)),
-                ft.Tab(text="Members", content=ft.Container(members_tab, padding=10)),
-            ]),
+        screen = show(
+            ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, tooltip="Groups",
+                                  on_click=lambda e: show_home()),
+                    ft.Icon(ft.Icons.LOCK, size=16),
+                    ft.Text(gname, size=20, weight=ft.FontWeight.BOLD, expand=True,
+                            overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.IconButton(ft.Icons.REFRESH, tooltip="Refresh",
+                                  on_click=lambda e: (refresh_chat(), refresh_incidents()))]),
+            ft.Tabs(length=3, selected_index=tab, expand=True, content=ft.Column(expand=True, controls=[
+                ft.TabBar(tabs=[ft.Tab(label="Chat"), ft.Tab(label="Incidents"),
+                                ft.Tab(label="Members")]),
+                ft.TabBarView(expand=True, controls=[chat_tab, incidents_tab, members_tab]),
+            ])),
+            scroll=False,
         )
-        page.update()
         refresh_chat()
         refresh_incidents()
         refresh_members()
@@ -672,13 +702,12 @@ def main(page: ft.Page):
                 if app["screen"] != screen or app["client"] is not c:
                     return
                 refresh_chat(quiet=True)
-        threading.Thread(target=poll, daemon=True).start()
+        page.run_thread(poll)
 
     # =====================================================================
     # SCREEN 4 — New incident
     # =====================================================================
     def show_new_incident():
-        new_screen()
         c = app["client"]
         gid = app["group_id"]
         photos = []  # list of {"name", "b64"} — ride inside the encrypted incident
@@ -690,9 +719,9 @@ def main(page: ft.Page):
                 photo_list.controls.append(ft.Text("No photos yet", size=11, italic=True))
             for idx, p in enumerate(photos):
                 photo_list.controls.append(ft.Row([
-                    ft.Icon(ft.icons.PHOTO, size=14),
+                    ft.Icon(ft.Icons.PHOTO, size=14),
                     ft.Text(p["name"], size=11, expand=True),
-                    ft.IconButton(ft.icons.CLOSE, icon_size=16, tooltip="Remove",
+                    ft.IconButton(ft.Icons.CLOSE, icon_size=16, tooltip="Remove",
                                   on_click=lambda e, i=idx: remove_photo(i)),
                 ]))
             page.update()
@@ -702,19 +731,13 @@ def main(page: ft.Page):
                 photos.pop(i)
                 render_photo_list()
 
-        def on_photos(e):
-            if not e.files:
-                return
-            for picked in e.files:
-                try:
-                    name, data = read_photo(picked.path)
+        async def on_photos(e):
+            try:
+                for name, data in await pick_photos(multiple=True):
                     photos.append({"name": name, "b64": base64.b64encode(data).decode()})
-                except Exception as ex:
-                    show_error(ex)
+            except Exception as ex:
+                show_error(ex)
             render_photo_list()
-
-        picker = ft.FilePicker(on_result=on_photos)
-        page.overlay.append(picker)
 
         try:
             member_names = [m["displayName"] for m in c.group_members(gid)]
@@ -725,10 +748,22 @@ def main(page: ft.Page):
         desc = ft.TextField(label="Description", multiline=True, min_lines=3)
         photo_desc = ft.TextField(label="Photo description")
         reporter = ft.TextField(label="Your name (reporter)", value=c.username)
-        assignee = ft.Dropdown(label="Assign to",
-                               options=[ft.dropdown.Option(n) for n in member_names])
-        target = ft.TextField(label="Target date (YYYY-MM-DD)")
-        save_btn = ft.ElevatedButton("Save incident", icon=ft.icons.SAVE)
+        assignee = ft.Dropdown(label="Assign to", expand=True,
+                               options=[ft.DropdownOption(key=n, text=n) for n in member_names])
+        target = ft.TextField(label="Target date (YYYY-MM-DD)",
+                              keyboard_type=ft.KeyboardType.DATETIME)
+
+        def pick_date(e):
+            def chosen(ev):
+                if ev.control.value:
+                    target.value = ev.control.value.strftime("%Y-%m-%d")
+                    page.update()
+            page.show_dialog(ft.DatePicker(first_date=datetime.now(), on_change=chosen,
+                                           help_text="Target date"))
+        target.expand = True
+        date_btn = ft.IconButton(ft.Icons.CALENDAR_MONTH, tooltip="Pick a date",
+                                 on_click=pick_date)
+        save_btn = ft.FilledButton("Save incident", icon=ft.Icons.SAVE)
 
         def save(e):
             if not title.value.strip():
@@ -749,35 +784,31 @@ def main(page: ft.Page):
             done = busy(save_btn, "Encrypting…")
             try:
                 c.create_incident(gid, incident)
-                toast("Incident saved (encrypted).")
                 show_group(tab=1)
+                toast("Incident saved (encrypted).")
             except Exception as ex:
                 done()
                 show_error(ex)
         save_btn.on_click = save
 
-        page.add(
-            ft.Row([ft.TextButton("← Back", on_click=lambda e: show_group(tab=1))]),
-            ft.Text("Report an incident", size=22, weight=ft.FontWeight.BOLD),
+        show(
+            ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: show_group(tab=1)),
+                    ft.Text("Report an incident", size=20, weight=ft.FontWeight.BOLD)]),
             title, desc,
-            ft.ElevatedButton("Attach photos", icon=ft.icons.PHOTO_CAMERA,
-                              on_click=lambda e: picker.pick_files(
-                                  allow_multiple=True, file_type=ft.FilePickerFileType.IMAGE)),
+            ft.Button("Attach photos", icon=ft.Icons.PHOTO_CAMERA, on_click=on_photos),
             photo_list,
-            photo_desc, reporter, assignee, target,
+            photo_desc, reporter, ft.Row([assignee]), ft.Row([target, date_btn]),
             save_btn,
         )
-        page.update()
         render_photo_list()
 
     # =====================================================================
     # SCREEN 5 — Incident detail: updates + PDF export
     # =====================================================================
     def open_incident(inc):
-        new_screen()
         c = app["client"]
         gid, gname = app["group_id"], app["group_name"]
-        update_text = ft.TextField(label="Add an update", expand=True)
+        update_text = ft.TextField(label="Add an update", expand=True, multiline=True)
 
         def save_and_reload():
             c.update_incident(gid, inc["_id"], _clean(inc))
@@ -801,23 +832,30 @@ def main(page: ft.Page):
             except Exception as ex:
                 show_error(ex)
 
-        def export_pdf(e):
+        async def export_pdf(e):
+            tmp = os.path.join(DATA_DIR, "_pdf_tmp")
+            os.makedirs(tmp, exist_ok=True)
             photo_paths = []
-            for i, p in enumerate(inc.get("photos", [])):
-                fp = os.path.join(DATA_DIR, f"_pdf_{i}_{p['name']}")
-                with open(fp, "wb") as f:
-                    f.write(base64.b64decode(p["b64"]))
-                photo_paths.append(fp)
-            path = make_pdf(inc, gname, photo_paths)
-            for fp in photo_paths:          # don't leave decrypted photos lying around
-                try:
-                    os.remove(fp)
-                except OSError:
-                    pass
-            toast(f"PDF saved: {path}")
+            try:
+                for i, p in enumerate(inc.get("photos", [])):
+                    fp = os.path.join(tmp, f"{i}_{os.path.basename(p['name'])}")
+                    with open(fp, "wb") as f:
+                        f.write(base64.b64decode(p["b64"]))
+                    photo_paths.append(fp)
+                path = make_pdf(inc, gname, photo_paths)
+                with open(path, "rb") as f:
+                    data = f.read()
+                os.remove(path)                  # don't leave decrypted copies around
+            finally:
+                for fp in photo_paths:
+                    try:
+                        os.remove(fp)
+                    except OSError:
+                        pass
+            await deliver_file(os.path.basename(path), data, "application/pdf")
 
         updates = [ft.Text(f"[{u['timestamp']}] {u.get('by', '') + ': ' if u.get('by') else ''}"
-                           f"{u['text']}", size=12)
+                           f"{u['text']}", size=12, selectable=True)
                    for u in inc.get("updates", [])]
 
         def make_remove(idx):
@@ -835,9 +873,10 @@ def main(page: ft.Page):
             for i, p in enumerate(inc.get("photos", []))
         ]
 
-        page.add(
-            ft.Row([ft.TextButton("← Back", on_click=lambda e: show_group(tab=1))]),
-            ft.Text(inc.get("title", "-"), size=22, weight=ft.FontWeight.BOLD),
+        show(
+            ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: show_group(tab=1)),
+                    ft.Text(inc.get("title", "-"), size=20, weight=ft.FontWeight.BOLD,
+                            expand=True)]),
             ft.Text(f"Reported by {inc.get('reporter') or '-'} on {inc.get('created_at')}", size=12),
             ft.Text(f"Assigned to: {inc.get('assigned_to') or '-'}", size=12),
             ft.Text(f"Target date: {inc.get('target_date') or '-'}", size=12),
@@ -850,21 +889,29 @@ def main(page: ft.Page):
             ft.Divider(),
             ft.Text("Updates", weight=ft.FontWeight.BOLD),
             *(updates or [ft.Text("No updates yet.", italic=True)]),
-            ft.Row([update_text, ft.ElevatedButton("Add", on_click=add_update)]),
+            ft.Row([update_text, ft.IconButton(ft.Icons.SEND, tooltip="Add update",
+                                               on_click=add_update)]),
             ft.Divider(),
             ft.Row(wrap=True, controls=[
-                ft.ElevatedButton("Toggle Open/Closed", on_click=toggle_status),
-                ft.ElevatedButton("Export PDF", icon=ft.icons.PICTURE_AS_PDF, on_click=export_pdf)]),
+                ft.Button("Mark Closed" if inc.get("status", "Open") == "Open" else "Re-open",
+                          on_click=toggle_status),
+                ft.Button("Share PDF" if is_mobile else "Export PDF",
+                          icon=ft.Icons.PICTURE_AS_PDF, on_click=export_pdf)]),
         )
-        page.update()
 
     def _clean(inc):
         """Strip the local-only helper fields before saving back."""
         return {k: v for k, v in inc.items() if not k.startswith("_")}
 
-    # Start on the sign-in screen.
+    # ------------------------------------------------------------ start
+    try:
+        config = FirebaseConfig.load()
+    except Exception as ex:
+        show(ft.Text("Firebase isn't configured yet", size=20, weight=ft.FontWeight.BOLD),
+             ft.Text(str(ex)))
+        return
     show_auth()
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)

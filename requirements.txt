@@ -1,7 +1,8 @@
-# Everything the phone app and demo need. There is no server to install —
-# Firebase (Auth + Firestore) is the backend, configured by firestore.rules.
-pynacl==1.5.0
+# For running on your computer and building the phone apps.
+# Phone builds read pyproject.toml; keep the two in sync.
+# There is no server to install — Firebase (Auth + Firestore) is the backend.
+flet[all]==1.1.2
+pynacl==1.6.2
 requests==2.32.3
-flet==0.24.1
-fpdf2==2.7.9
-pillow>=10.4
+fpdf2==2.8.3
+pillow==12.3.0

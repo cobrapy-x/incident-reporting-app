@@ -1,4 +1,4 @@
-# Incident Reporting App — Firebase + end-to-end encrypted
+# Facilis Relatio — incident reporting, Firebase + end-to-end encrypted
 
 A free incident reporting app for site teams. Employers set up an
 **organisation** and **groups**; employees join with their email, phone and a
@@ -9,7 +9,7 @@ Every message, photo and report is **end-to-end encrypted** on the phone. Fireba
 only ever stores ciphertext, and an employer can never see another
 organisation's groups.
 
-- **Phone app:** Flet (Python) — Android, iOS and desktop
+- **App:** Flet 1.x (Python) — Android, iOS and desktop from one codebase
 - **Backend:** Firebase Auth + Cloud Firestore on the **free Spark plan** —
   no server to run. `firestore.rules` is the whole backend.
 - **Encryption:** libsodium / PyNaCl; passwords stretched with Argon2id on-device
@@ -45,8 +45,13 @@ only if someone hands them an unlocked phone — no app can stop that.)
 | `fake_firebase.py` | Offline stand-in for Firebase used by `demo.py` (tests only). |
 | `SECURITY.md` | Threat model and crypto, in plain words. |
 | `DEPLOY_FIREBASE.md` | Step-by-step Firebase setup. |
+| `BUILD_MOBILE.md` | Building and sharing the Android + iPhone apps. |
+| `pyproject.toml`, `assets/icon.png` | Phone-app name, bundle id, version, icon, permissions. |
+| `build_android.sh`, `build_ios.sh` | Signed phone builds. |
 
 ## Quick start (Mac / Linux)
+
+Needs Python 3.10+ (3.12 recommended — macOS's built-in `python3` is 3.9).
 
 ```bash
 bash setup.sh                      # makes a venv and installs everything
@@ -62,6 +67,11 @@ cp firebase_config.example.json firebase_config.json   # fill in apiKey + projec
 firebase deploy --only firestore:rules,firestore:indexes
 bash run_app.sh
 ```
+
+## Phone apps
+
+See **[BUILD_MOBILE.md](BUILD_MOBILE.md)**: `flet build apk` for Android,
+`bash build_ios.sh` for iPhone (Mac + Apple Developer account).
 
 ### Windows
 

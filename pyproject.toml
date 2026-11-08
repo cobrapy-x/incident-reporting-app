@@ -1,0 +1,66 @@
+# Build settings for the phone apps (read by `flet build`). See BUILD_MOBILE.md.
+[project]
+name = "facilis-relatio"
+version = "1.0.0"                     # shown to users; bump for each release
+description = "Facilis Relatio — end-to-end encrypted incident reporting for site teams"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"   # Python bundled INTO the app (3.12 has every mobile wheel)
+authors = [{ name = "Cobrapy-x" }]
+# Phone builds install exactly these. Versions are pinned to ones that have
+# pre-built Android + iOS wheels on Flet's mobile index (pypi.flet.dev).
+dependencies = [
+  "flet==1.1.2",
+  "pynacl==1.6.2",
+  "requests==2.32.3",
+  "fpdf2==2.8.3",
+  "pillow==12.3.0",
+]
+
+[tool.flet]
+product = "Facilis Relatio"           # name under the icon
+org = "io.github.cobrapyx"
+# The store identity of the app. Pick it once — changing it later makes a
+# DIFFERENT app on Play Store / App Store.
+bundle_id = "io.github.cobrapyx.facilisrelatio"
+company = "Cobrapy-x"
+copyright = "Copyright (C) 2026 Cobrapy-x"
+build_number = 1                      # must go up by 1 for every store upload
+icon_background = "#0B3D91"
+
+[tool.flet.app]
+path = "."
+# Never ship test tools, docs, local data or Firebase CLI files inside the app.
+# (venv/ and hidden files are left out automatically.)
+exclude = [
+  "app_data", "build", "demo.py", "fake_firebase.py", "setup.sh", "run_app.sh",
+  "run_emulator_demo.sh", "firebase.json", "firestore.rules", "firestore.indexes.json",
+  "firebase_config.example.json", "firebase-debug.log", "firestore-debug.log",
+  "ui-debug.log", "README.md", "SECURITY.md", "DEPLOY_FIREBASE.md", "BUILD_MOBILE.md",
+  "LICENSE", "requirements.txt",
+]
+
+[tool.flet.splash]
+color = "#0B3D91"
+dark_color = "#061F4D"
+
+[tool.flet.android]
+adaptive_icon_background = "#0B3D91"
+
+# Photos are picked with the system photo picker, which needs no permission,
+# and the Play Store rejects apps that ask for broad media access without need.
+[tool.flet.android.permission]
+"android.permission.INTERNET" = true
+
+# Release signing: build_android.sh points the build at ~/keys/facilis-relatio.jks
+# and asks for its password. Keep that file OUTSIDE this repo and back it up —
+# losing it means you can never ship an update to the same Android app.
+[tool.flet.android.signing]
+key_alias = "facilis"
+
+[tool.flet.ios]
+export_method = "app-store-connect"    # TestFlight + App Store
+# team_id = "ABCDE12345"               # from developer.apple.com → Membership
+
+[tool.flet.ios.info]
+NSPhotoLibraryUsageDescription = "Facilis Relatio lets you attach photos to incident reports and chats."
+NSCameraUsageDescription = "Facilis Relatio lets you photograph incidents for your reports."
