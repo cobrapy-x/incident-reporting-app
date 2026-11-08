@@ -35,3 +35,6 @@ ui-debug.log
 *.keystore
 *.p12
 *.mobileprovision
+
+# Files the Claude desktop app saves into this folder
+Claude outputs/
